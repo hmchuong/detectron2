@@ -158,6 +158,7 @@ class SemSegFPNHead(nn.Module):
             In training, returns (None, dict of losses)
             In inference, returns (CxHxW logits, {})
         """
+        # import pdb; pdb.set_trace()
         x = self.layers(features)
         if self.training:
             return None, self.losses(x, targets)

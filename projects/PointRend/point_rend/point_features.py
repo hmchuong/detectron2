@@ -115,6 +115,11 @@ def get_uncertain_point_coords_with_randomness(
         )
     return point_coords
 
+'''
+alpha * uncertainty score + (1-alpha) * error score ~ prediction score
+
+(Boundary of image + coarse segmentation) --> (1.0 - probs of correct class) ~ error score
+'''
 
 def get_uncertain_point_coords_on_grid(uncertainty_map, num_points):
     """
