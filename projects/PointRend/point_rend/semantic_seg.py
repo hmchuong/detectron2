@@ -11,13 +11,16 @@ from detectron2.modeling import SEM_SEG_HEADS_REGISTRY
 from .point_features import (
     get_uncertain_point_coords_on_grid,
     get_uncertain_point_coords_with_randomness,
-    point_sample,
+    get_error_coords_with_randomness,
+    point_sample
 )
 from .point_head import build_point_head
 
 def concatenate(feats):
     _, _, H, W = feats[0].size()
     x = []
+    if len(feats) == 1:
+        return feats[0]
     for feat in feats:
         x += [F.interpolate(feat, size=(H, W), mode='bilinear')]
     return torch.cat(x, dim=1)
@@ -59,8 +62,10 @@ class ErrorPredictor(nn.Module):
     
     def __init__(self, cfg, ignore_value, input_shape):
         super().__init__()
+        num_classes = cfg.MODEL.POINT_HEAD.NUM_CLASSES
+        # import pdb; pdb.set_trace()
         self.convs = nn.Sequential(
-            nn.Conv2d(input_shape.channels, cfg.MODEL.POINT_HEAD.FC_DIM, kernel_size=3, stride=1, padding=1), 
+            nn.Conv2d(input_shape.channels + num_classes, cfg.MODEL.POINT_HEAD.FC_DIM, kernel_size=3, stride=1, padding=1), 
             nn.BatchNorm2d(cfg.MODEL.POINT_HEAD.FC_DIM), 
             nn.ReLU(), 
             nn.Conv2d(cfg.MODEL.POINT_HEAD.FC_DIM, cfg.MODEL.POINT_HEAD.FC_DIM, kernel_size=3, stride=1, padding=1), 
@@ -88,6 +93,7 @@ class ErrorPredictor(nn.Module):
         logits = logits[valid, :]
 
         score = (one_hot(target, C) * torch.softmax(logits, dim=1)).sum(1)
+        score = 1.0 - score
 
         inp = inp.clamp(1e-7, 1.0 - 1e-7)
         loss = F.binary_cross_entropy(inp, score, reduction="mean", weight=torch.Tensor([10]).to(inp.device))
@@ -96,8 +102,10 @@ class ErrorPredictor(nn.Module):
         return loss
         
 
-    def forward(self, features):
-        return self.convs(features).squeeze(1)
+    def forward(self, coarse_feat, fine_feat):
+        x = concatenate([coarse_feat, fine_feat])
+        # import pdb; pdb.set_trace()
+        return self.convs(x).squeeze(1)
 
 @SEM_SEG_HEADS_REGISTRY.register()
 class PointRendSemSegHead(nn.Module):
@@ -115,10 +123,6 @@ class PointRendSemSegHead(nn.Module):
             cfg.MODEL.POINT_HEAD.COARSE_SEM_SEG_HEAD_NAME
         )(cfg, input_shape)
         self._init_point_head(cfg, input_shape)
-
-        # Missing points predictor
-        in_channels             = sum([v.channels for k, v in input_shape.items()])
-        self.error_predictor = ErrorPredictor(cfg, self.ignore_value, ShapeSpec(channels=in_channels, width=1, height=1))
         
 
     def _init_point_head(self, cfg, input_shape: Dict[str, ShapeSpec]):
@@ -136,6 +140,9 @@ class PointRendSemSegHead(nn.Module):
         in_channels = np.sum([feature_channels[f] for f in self.in_features])
         self.point_head = build_point_head(cfg, ShapeSpec(channels=in_channels, width=1, height=1))
 
+        # Missing points predictor
+        self.error_predictor = ErrorPredictor(cfg, self.ignore_value, ShapeSpec(channels=in_channels, width=1, height=1))
+
     def forward(self, features, targets=None):
         # import pdb; pdb.set_trace()
         '''
@@ -149,21 +156,26 @@ class PointRendSemSegHead(nn.Module):
 
         if self.training:
             losses = self.coarse_sem_seg_head.losses(coarse_sem_seg_logits, targets) # Upsample logits -> CE(logits, targets)
-            if torch.isnan(losses['loss_sem_seg']):
-                import pdb; pdb.set_trace()
+
             # Predict error
-            all_features = concatenate([v.clone().detach() for v in features.values()])
-            error_logits = self.error_predictor(all_features)
-            losses["loss_sem_seg_refine"] = self.error_predictor.losses(error_logits, coarse_sem_seg_logits.clone().detach(), targets)
+            fine_features = concatenate([features[in_feature].clone().detach() for in_feature in self.in_features])
+            error_pred = self.error_predictor(coarse_sem_seg_logits.clone().detach(), fine_features)
+            losses["loss_sem_seg_refine"] = self.error_predictor.losses(error_pred, coarse_sem_seg_logits.clone().detach(), targets)
 
             with torch.no_grad():
-                point_coords = get_uncertain_point_coords_with_randomness(
-                    coarse_sem_seg_logits,
-                    calculate_uncertainty,
+                # point_coords = get_uncertain_point_coords_with_randomness(
+                #     coarse_sem_seg_logits,
+                #     calculate_uncertainty,
+                #     self.train_num_points,
+                #     self.oversample_ratio,
+                #     self.importance_sample_ratio,
+                # ) # batch x points x 2 (x, y)
+                point_coords = get_error_coords_with_randomness(
+                    error_pred.unsqueeze(1),
                     self.train_num_points,
                     self.oversample_ratio,
-                    self.importance_sample_ratio,
-                ) # batch x points x 2 (x, y)
+                    self.importance_sample_ratio
+                )
 
             coarse_features = point_sample(coarse_sem_seg_logits, point_coords, align_corners=False) # batch x n_class x train_num_points
 
@@ -192,15 +204,20 @@ class PointRendSemSegHead(nn.Module):
             return None, losses
         else:
             sem_seg_logits = coarse_sem_seg_logits.clone()
-            for _ in range(self.subdivision_steps):
+            for i in range(self.subdivision_steps):
                 sem_seg_logits = F.interpolate(
                     sem_seg_logits, scale_factor=2, mode="bilinear", align_corners=False
                 )
+                
+                fine_features = concatenate([features[in_feature] for in_feature in self.in_features])
+                uncertainty_map = self.error_predictor(sem_seg_logits, fine_features)
 
-                # TODO: Predict better points
-                uncertainty_map = calculate_uncertainty(sem_seg_logits)
+                # Predict better points
+                alpha = 1.0
+                combine_map = alpha * calculate_uncertainty(sem_seg_logits) + (1 - alpha) * uncertainty_map
+
                 point_indices, point_coords = get_uncertain_point_coords_on_grid(
-                    uncertainty_map, self.subdivision_num_points
+                    combine_map, self.subdivision_num_points
                 )
 
                 fine_grained_features = cat(

@@ -1,0 +1,2 @@
+export DETECTRON2_DATASETS=/home/ubuntu/detectron_dataset
+python train_net.py --config-file configs/SemanticSegmentation/pointrend_semantic_R_101_FPN_1x_cityscapes.yaml --eval-only MODEL.WEIGHTS output/error_score_1/model_0099999.pth
